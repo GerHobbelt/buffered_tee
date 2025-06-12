@@ -134,6 +134,8 @@ int main(int argc, const char **argv) {
 
 	// NOTE: right now, all input files have been read and *closed*; their content resides in lines[].
 
+	size_t written_line_count = 0;
+
 	if (lines.empty()) {
 		if (!quiet_mode) {
 			if (show_progress) {
@@ -211,7 +213,6 @@ int main(int argc, const char **argv) {
 				}
 			}
 
-			size_t written_line_count = 0;
 			for (/* const */ std::string& l : lines) {
 				for (auto &outFile : ofs) {
 					outFile << l << '\n';
@@ -250,6 +251,7 @@ int main(int argc, const char **argv) {
 
 	if (!quiet_mode) {
 		std::cerr << "All done." << std::endl;
+		std::cerr << written_line_count << " lines written." << std::endl;
 		std::cerr << timer.to_string() << std::endl;
 	}
 
