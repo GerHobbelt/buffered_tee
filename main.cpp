@@ -1,0 +1,191 @@
+
+#include <iostream>
+#include <string>
+#include <vector>
+#include <set>
+#include <map>
+#include <chrono>
+#include <algorithm>
+
+#ifdef CLI11_SINGLE_FILE
+#include "CLI11.hpp"
+#else
+#include "CLI/CLI.hpp"
+#endif
+#include "CLI/Timer.hpp"
+
+//#include <ghc/fs_std.hpp>  // namespace fs = std::filesystem;   or   namespace fs = ghc::filesystem;
+
+
+/*
+* Fetch input from stdin until EOF.
+*
+* Buffer everything and separate the input into text lines, which will be sorted and de-duplicated.
+*/
+
+int main(int argc, const char **argv) {
+	CLI::App app{"buffered_tee"};
+	CLI::Timer timer{"My Timer"};
+
+	std::vector<std::string> outFiles;
+	app.add_option("--outfile,-o", outFiles, "specify the file location of the output") /* ->required() */;
+	bool show_progress = false;
+	app.add_flag("-p,--progress", show_progress);
+	bool append_to_file = false;
+	app.add_flag("-a,--append", append_to_file);
+	bool quiet_mode = false;
+	app.add_flag("-q,--quiet", quiet_mode);
+	bool deduplicate = false;
+	app.add_flag("-u,--unique", deduplicate, "deduplication implies --sort");
+	bool sorting = false;
+	app.add_flag("-s,--sort", sorting);
+	bool cleanup_stdout = false;
+	app.add_flag("-c,--cleanup", cleanup_stdout);
+	std::optional<std::uint64_t> redux_opt;
+	app.add_option("-r,--redux", redux_opt, "reduced stdout output / stderr progress noise: output 1 line for each N input lines.");
+
+	CLI11_PARSE(app, argc, argv);
+
+	if (outFiles.empty()) {
+		//std::cerr << "No output files specified. Use --outfile or -o to specify at least one output file." << std::endl;
+		std::cerr << "Warning: no output files specified. All you'll see is the progress/echo to stderr/stdout! Use --outfile or -o to specify at least one output file." << std::endl;
+		//return 1;
+	}
+
+	if (quiet_mode && redux_opt) {
+		std::cerr << "Warning: --redux option is ignored when --quiet is enabled." << std::endl;
+	}
+
+	if (deduplicate)
+		sorting = true;
+
+	uint64_t redux_lines = (redux_opt ? redux_opt.value() : 0);
+
+	// read lines from stdin:
+	std::string line;
+	std::vector<std::string> lines;
+	while (std::getline(std::cin, line)) {
+		//if (!line.empty()) {
+		lines.push_back(line);
+		//}
+		
+		// show progress if requested
+		if (!quiet_mode) {
+			if (redux_lines <= 1 || lines.size() % redux_lines == 1) {
+				if (show_progress) {
+					std::cerr << ".";
+				}
+			}
+		}
+	}
+
+	if (lines.empty()) {
+		if (!quiet_mode) {
+			if (show_progress) {
+				std::cerr << "stdin input feed is empty (no text lines). Skipping writing the output files!" << std::endl;
+			}
+		}
+	}
+	else {
+		if (!quiet_mode) {
+			if (show_progress) {
+				std::cerr << std::endl;
+			}
+		}
+
+		// performance: sort/dedup *references* to the line strings, so that we don't have to copy/swap the strings themselves.
+		// https://stackoverflow.com/questions/25108854/initializing-the-size-of-a-c-vector
+		// https://stackoverflow.com/questions/33767668/performance-comparison-of-stl-sort-on-vector-of-strings-vs-vector-of-string-pointers
+
+#if 0  // useless; rest of code that follows has been deleted; this chunk is kept as a reminder only.
+		std::vector<std::string &> line_refs; // error C2338: static_assert failed: 'The C++ Standard forbids allocators for reference elements because of [allocator.requirements].'
+		line_refs.reserve(lines.size());
+		for (auto &l : lines) {
+			line_refs.push_back(l);
+		}
+#endif
+
+		if (sorting) {
+			// sort and deduplicate lines
+			std::sort(lines.begin(), lines.end());
+
+			if (!quiet_mode) {
+				if (show_progress) {
+					std::cerr << "Sorted." << std::endl;
+				}
+			}
+
+			if (deduplicate) {
+				auto last = std::unique(lines.begin(), lines.end());
+				size_t dropped_dupe_count = std::distance(last, lines.end());
+				lines.erase(last, lines.end());
+
+				if (!quiet_mode) {
+					if (show_progress) {
+						std::cerr << "Deduplicated; dropped " << dropped_dupe_count << " lines." << std::endl;
+					}
+				}
+			}
+		}
+
+		// write to output files
+		//
+		// Note: when any of them fails to open, then abort all output.
+		{
+			std::vector<std::ofstream> ofs;
+			for (const auto &outFile : outFiles) {
+				std::ofstream of(outFile, (append_to_file ? std::ios::app : std::ios::trunc));
+				if (!of) {
+					std::cerr << "Error opening output file: " << outFile << std::endl;
+					return 1;
+				}
+				ofs.push_back(std::move(of));
+			}
+
+			if (!quiet_mode) {
+				if (show_progress) {
+					std::cerr << "Writing to output files..." << std::endl;
+				}
+			}
+
+			size_t written_line_count = 0;
+			for (/* const */ std::string& l : lines) {
+				for (auto &outFile : ofs) {
+					outFile << l << '\n';
+				}
+				written_line_count++;
+
+				// show progress if requested
+				if (!quiet_mode) {
+					if (redux_lines <= 1 || written_line_count % redux_lines == 1) {
+						if (show_progress) {
+							std::cerr << ".";
+						}
+						else {
+							if (cleanup_stdout) {
+								// replace all non-ASCII, non-printable characters in string with '.':
+								std::replace_if(l.begin(), l.end(), [](char ch) {
+									return (static_cast<unsigned char>(ch) < 32 || static_cast<unsigned char>(ch) > 126);
+								}, '.');
+							}
+							std::cout << l << '\n';
+						}
+					}
+				}
+			}
+		} // end of scope for the output files --> auto-close!
+
+		if (!quiet_mode) {
+			if (show_progress) {
+				std::cerr << std::endl;
+			}
+		}
+	}
+
+	if (!quiet_mode) {
+		std::cerr << "All done." << std::endl;
+		std::cerr << timer.to_string() << std::endl;
+	}
+
+	return 0;
+}
