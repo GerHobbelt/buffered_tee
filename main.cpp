@@ -1,5 +1,6 @@
 
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <set>
@@ -17,6 +18,12 @@
 //#include <ghc/fs_std.hpp>  // namespace fs = std::filesystem;   or   namespace fs = ghc::filesystem;
 
 
+// We accept '.' and '-' as file names representing stdin/stdout:
+static bool is_stdin_stdout(const std::string &filename) {
+	return (filename == "." || filename == "-" || filename == "/dev/stdin" || filename == "/dev/stdout");
+}
+
+
 /*
 * Fetch input from stdin until EOF.
 *
@@ -25,10 +32,12 @@
 
 int main(int argc, const char **argv) {
 	CLI::App app{"buffered_tee"};
-	CLI::Timer timer{"My Timer"};
+	CLI::Timer timer{"Time taken"};
 
+	std::vector<std::string> inFiles;
+	app.add_option("--infile,-i", inFiles, "specify the file location of an input file") /* ->required() */;
 	std::vector<std::string> outFiles;
-	app.add_option("--outfile,-o", outFiles, "specify the file location of the output") /* ->required() */;
+	app.add_option("--outfile,-o", outFiles, "specify the file location of an output file") /* ->required() */;
 	bool show_progress = false;
 	app.add_flag("-p,--progress", show_progress);
 	bool append_to_file = false;
@@ -39,17 +48,23 @@ int main(int argc, const char **argv) {
 	app.add_flag("-u,--unique", deduplicate, "deduplication implies --sort");
 	bool sorting = false;
 	app.add_flag("-s,--sort", sorting);
-	bool cleanup_stdout = false;
-	app.add_flag("-c,--cleanup", cleanup_stdout);
+	bool cleanup_stderr = false;
+	app.add_flag("-c,--cleanup", cleanup_stderr);
 	std::optional<std::uint64_t> redux_opt;
 	app.add_option("-r,--redux", redux_opt, "reduced stdout output / stderr progress noise: output 1 line for each N input lines.");
 
 	CLI11_PARSE(app, argc, argv);
 
 	if (outFiles.empty()) {
-		//std::cerr << "No output files specified. Use --outfile or -o to specify at least one output file." << std::endl;
-		std::cerr << "Warning: no output files specified. All you'll see is the progress/echo to stderr/stdout! Use --outfile or -o to specify at least one output file." << std::endl;
-		//return 1;
+		std::cerr << "Warning: no output files specified. All you'll see is the progress/echo to stderr/stdout!\n    Use --outfile or -o to specify at least one output file." << std::endl;
+
+		outFiles.push_back("-"); // use stdout as output
+	}
+
+	if (inFiles.empty()) {
+		std::cerr << "Notice: no input files specified: STDIN is used instead!\n    Use --infile or -i to specify at least one output file." << std::endl;
+
+		inFiles.push_back("-"); // use stdin as input
 	}
 
 	if (quiet_mode && redux_opt) {
@@ -61,28 +76,68 @@ int main(int argc, const char **argv) {
 
 	uint64_t redux_lines = (redux_opt ? redux_opt.value() : 0);
 
-	// read lines from stdin:
-	std::string line;
+	// read lines from stdin/inputs:
+	// 
+	// https://stackoverflow.com/questions/6089231/getting-std-ifstream-to-handle-lf-cr-and-crlf
 	std::vector<std::string> lines;
-	while (std::getline(std::cin, line)) {
-		//if (!line.empty()) {
-		lines.push_back(line);
-		//}
-		
-		// show progress if requested
-		if (!quiet_mode) {
-			if (redux_lines <= 1 || lines.size() % redux_lines == 1) {
-				if (show_progress) {
-					std::cerr << ".";
+
+
+	if (!quiet_mode) {
+		if (show_progress) {
+			std::cerr << "Reading from input files..." << std::endl;
+		}
+	}
+
+	for (const auto &inFile : inFiles) {
+		if (is_stdin_stdout(inFile)) {
+			// use stdin
+				
+			//ifs.emplace_back(std::cin.rdbuf());
+
+			std::string line;
+			while (std::getline(std::cin, line)) {
+				lines.push_back(line);
+
+				// show progress if requested
+				if (!quiet_mode) {
+					if (redux_lines <= 1 || lines.size() % redux_lines == 1) {
+						if (show_progress) {
+							std::cerr << ".";
+						}
+					}
+				}
+			}
+		}
+		else {
+			// open file
+			std::ifstream ifs(inFile);
+			if (!ifs) {
+				std::cerr << "Error opening input file: " << inFile << std::endl;
+				return 1;
+			}
+
+			std::string line;
+			while (std::getline(ifs, line)) {
+				lines.push_back(line);
+
+				// show progress if requested
+				if (!quiet_mode) {
+					if (redux_lines <= 1 || lines.size() % redux_lines == 1) {
+						if (show_progress) {
+							std::cerr << ".";
+						}
+					}
 				}
 			}
 		}
 	}
 
+	// NOTE: right now, all input files have been read and *closed*; their content resides in lines[].
+
 	if (lines.empty()) {
 		if (!quiet_mode) {
 			if (show_progress) {
-				std::cerr << "stdin input feed is empty (no text lines). Skipping writing the output files!" << std::endl;
+				std::cerr << "Warning: Input feed is empty (no text lines read). We will SKIP writing the output files!" << std::endl;
 			}
 		}
 	}
@@ -118,11 +173,12 @@ int main(int argc, const char **argv) {
 			if (deduplicate) {
 				auto last = std::unique(lines.begin(), lines.end());
 				size_t dropped_dupe_count = std::distance(last, lines.end());
+				size_t remaining_count = std::distance(lines.begin(), last);
 				lines.erase(last, lines.end());
 
 				if (!quiet_mode) {
 					if (show_progress) {
-						std::cerr << "Deduplicated; dropped " << dropped_dupe_count << " lines." << std::endl;
+						std::cerr << "Deduplicated; dropped " << dropped_dupe_count << " / " << remaining_count << " lines." << std::endl;
 					}
 				}
 			}
@@ -132,14 +188,21 @@ int main(int argc, const char **argv) {
 		//
 		// Note: when any of them fails to open, then abort all output.
 		{
+			bool stdout_is_one_of_the_outputs = false;
 			std::vector<std::ofstream> ofs;
 			for (const auto &outFile : outFiles) {
-				std::ofstream of(outFile, (append_to_file ? std::ios::app : std::ios::trunc));
-				if (!of) {
-					std::cerr << "Error opening output file: " << outFile << std::endl;
-					return 1;
+				if (is_stdin_stdout(outFile)) {
+					// use stdout
+					stdout_is_one_of_the_outputs = true;
 				}
-				ofs.push_back(std::move(of));
+				else {
+					std::ofstream of(outFile, (append_to_file ? std::ios::app : std::ios::trunc));
+					if (!of) {
+						std::cerr << "Error opening output file: " << outFile << std::endl;
+						return 1;
+					}
+					ofs.push_back(std::move(of));
+				}
 			}
 
 			if (!quiet_mode) {
@@ -153,6 +216,9 @@ int main(int argc, const char **argv) {
 				for (auto &outFile : ofs) {
 					outFile << l << '\n';
 				}
+				if (stdout_is_one_of_the_outputs) {
+					std::cout << l << '\n';
+				}
 				written_line_count++;
 
 				// show progress if requested
@@ -161,14 +227,14 @@ int main(int argc, const char **argv) {
 						if (show_progress) {
 							std::cerr << ".";
 						}
-						else {
-							if (cleanup_stdout) {
+						else /* if (!stdout_is_one_of_the_outputs) */ {
+							if (cleanup_stderr) {
 								// replace all non-ASCII, non-printable characters in string with '.':
 								std::replace_if(l.begin(), l.end(), [](char ch) {
 									return (static_cast<unsigned char>(ch) < 32 || static_cast<unsigned char>(ch) > 126);
 								}, '.');
 							}
-							std::cout << l << '\n';
+							std::cerr << l << '\n';
 						}
 					}
 				}
