@@ -7,6 +7,10 @@
 #include <map>
 #include <chrono>
 #include <algorithm>
+#include <future>
+#include <atomic>
+#include <chrono>
+#include <thread>
 
 #ifdef CLI11_SINGLE_FILE
 #include "CLI11.hpp"
@@ -16,6 +20,53 @@
 #include "CLI/Timer.hpp"
 
 //#include <ghc/fs_std.hpp>  // namespace fs = std::filesystem;   or   namespace fs = ghc::filesystem;
+
+// run an async timer task which sets a mark every time a bit of progress MAY be shown.
+// This takes care of the variable and sometimes obnoxiously high '.' dot progress rate/output.
+class ProgressTimer
+{
+	std::future<int> t;
+	std::atomic<bool> ticked = false;
+	std::atomic<bool> must_stop = false;
+
+public:
+	void init(void)
+	{
+		t = std::async(std::launch::async, &ProgressTimer::timer_task, this);
+	}
+
+	~ProgressTimer()
+	{
+		must_stop = true;
+		t.wait();
+		(void)t.get();
+	}
+
+	int timer_task(void)
+	{
+		using namespace std::chrono_literals;
+
+		ticked = true;
+
+		while (!must_stop) {
+			ticked = true;
+
+			std::this_thread::sleep_for(125ms);
+		}
+
+		ticked = true;
+
+		return 0;
+	}
+
+	void show_progress(void)
+	{
+		auto triggered = ticked.exchange(false);
+		if (triggered) {
+			std::cerr << ".";
+		}
+	}
+};
 
 
 // We accept '.' and '-' as file names representing stdin/stdout:
@@ -33,6 +84,7 @@ static bool is_stdin_stdout(const std::string &filename) {
 int main(int argc, const char **argv) {
 	CLI::App app{"buffered_tee"};
 	CLI::Timer timer{"Time taken"};
+	ProgressTimer progress;
 
 	std::vector<std::string> inFiles;
 	app.add_option("--infile,-i", inFiles, "specify the file location of an input file") /* ->required() */;
@@ -76,6 +128,8 @@ int main(int argc, const char **argv) {
 
 	uint64_t redux_lines = (redux_opt ? redux_opt.value() : 0);
 
+	progress.init();
+
 	// read lines from stdin/inputs:
 	// 
 	// https://stackoverflow.com/questions/6089231/getting-std-ifstream-to-handle-lf-cr-and-crlf
@@ -102,7 +156,7 @@ int main(int argc, const char **argv) {
 				if (!quiet_mode) {
 					if (redux_lines <= 1 || lines.size() % redux_lines == 1) {
 						if (show_progress) {
-							std::cerr << ".";
+							progress.show_progress();
 						}
 					}
 				}
@@ -124,7 +178,7 @@ int main(int argc, const char **argv) {
 				if (!quiet_mode) {
 					if (redux_lines <= 1 || lines.size() % redux_lines == 1) {
 						if (show_progress) {
-							std::cerr << ".";
+							progress.show_progress();
 						}
 					}
 				}
@@ -226,7 +280,7 @@ int main(int argc, const char **argv) {
 				if (!quiet_mode) {
 					if (redux_lines <= 1 || written_line_count % redux_lines == 1) {
 						if (show_progress) {
-							std::cerr << ".";
+							progress.show_progress();
 						}
 						else /* if (!stdout_is_one_of_the_outputs) */ {
 							if (cleanup_stderr) {
