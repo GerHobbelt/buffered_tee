@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <format>
 
 #ifdef CLI11_SINGLE_FILE
 #include "CLI11.hpp"
@@ -83,7 +84,7 @@ static bool is_stdin_stdout(const std::string &filename) {
 
 int main(int argc, const char **argv) {
 	CLI::App app{"buffered_tee"};
-	CLI::Timer timer{"Time taken"};
+	CLI::Timer timer;
 	ProgressTimer progress;
 
 	std::vector<std::string> inFiles;
@@ -126,7 +127,7 @@ int main(int argc, const char **argv) {
 	if (deduplicate)
 		sorting = true;
 
-	uint64_t redux_lines = (redux_opt ? redux_opt.value() : 0);
+	uint64_t redux_lines = redux_opt.value_or(0);
 
 	progress.init();
 
@@ -138,53 +139,68 @@ int main(int argc, const char **argv) {
 
 	if (!quiet_mode) {
 		if (show_progress) {
-			std::cerr << "Reading from input files..." << std::endl;
+			std::cerr << "Reading from input files...";
 		}
 	}
 
-	for (const auto &inFile : inFiles) {
-		if (is_stdin_stdout(inFile)) {
-			// use stdin
-				
-			//ifs.emplace_back(std::cin.rdbuf());
+	double timer_rd_time;
+	std::optional<double> timer_sort_time;
+	std::optional<double> timer_wr_time;
 
-			std::string line;
-			while (std::getline(std::cin, line)) {
-				lines.push_back(line);
+	CLI::Timer timer_rd;
+	{
+		//CLI::Timer timer_rd;
 
-				// show progress if requested
-				if (!quiet_mode) {
-					if (redux_lines <= 1 || lines.size() % redux_lines == 1) {
-						if (show_progress) {
-							progress.show_progress();
+		for (const auto &inFile : inFiles) {
+			if (is_stdin_stdout(inFile)) {
+				// use stdin
+
+				//ifs.emplace_back(std::cin.rdbuf());
+
+				std::string line;
+				while (std::getline(std::cin, line)) {
+					lines.push_back(line);
+
+					// show progress if requested
+					if (!quiet_mode) {
+						if (redux_lines <= 1 || lines.size() % redux_lines == 1) {
+							if (show_progress) {
+								progress.show_progress();
+							}
+						}
+					}
+				}
+			} else {
+				// open file
+				std::ifstream ifs(inFile);
+				if (!ifs) {
+					std::cerr << std::endl << "Error opening input file: " << inFile << std::endl;
+					return 1;
+				}
+
+				std::string line;
+				while (std::getline(ifs, line)) {
+					lines.push_back(line);
+
+					// show progress if requested
+					if (!quiet_mode) {
+						if (redux_lines <= 1 || lines.size() % redux_lines == 1) {
+							if (show_progress) {
+								progress.show_progress();
+							}
 						}
 					}
 				}
 			}
 		}
-		else {
-			// open file
-			std::ifstream ifs(inFile);
-			if (!ifs) {
-				std::cerr << "Error opening input file: " << inFile << std::endl;
-				return 1;
-			}
 
-			std::string line;
-			while (std::getline(ifs, line)) {
-				lines.push_back(line);
-
-				// show progress if requested
-				if (!quiet_mode) {
-					if (redux_lines <= 1 || lines.size() % redux_lines == 1) {
-						if (show_progress) {
-							progress.show_progress();
-						}
-					}
-				}
-			}
-		}
+#if 0
+		// do NOT stop & get the elpased time WITHIN the scope block as that would introduce
+		// the COSTLY mistake of NOT INCLUDING THE TIME SPENT in the destructors!!
+		timer_rd_time = timer_rd();
+#endif
 	}
+	timer_rd_time = timer_rd();
 
 	// NOTE: right now, all input files have been read and *closed*; their content resides in lines[].
 
@@ -193,7 +209,7 @@ int main(int argc, const char **argv) {
 	if (lines.empty()) {
 		if (!quiet_mode) {
 			if (show_progress) {
-				std::cerr << "Warning: Input feed is empty (no text lines read). We will SKIP writing the output files!" << std::endl;
+				std::cerr << std::endl << "Warning: Input feed is empty (no text lines read). We will SKIP writing the output files!" << std::endl;
 			}
 		}
 	}
@@ -216,6 +232,7 @@ int main(int argc, const char **argv) {
 		}
 #endif
 
+		CLI::Timer timer_sort;
 		if (sorting) {
 			// sort and deduplicate lines
 			std::sort(lines.begin(), lines.end());
@@ -238,11 +255,17 @@ int main(int argc, const char **argv) {
 					}
 				}
 			}
+
+			//timer_sort_time = timer_sort();
 		}
+
+		if (sorting)
+			timer_sort_time = timer_sort();
 
 		// write to output files
 		//
 		// Note: when any of them fails to open, then abort all output.
+		CLI::Timer timer_wr;
 		{
 			bool stdout_is_one_of_the_outputs = false;
 			std::vector<std::ofstream> ofs;
@@ -263,7 +286,7 @@ int main(int argc, const char **argv) {
 
 			if (!quiet_mode) {
 				if (show_progress) {
-					std::cerr << "Writing to output files..." << std::endl;
+					std::cerr << "Writing to output files...";
 				}
 			}
 
@@ -294,7 +317,11 @@ int main(int argc, const char **argv) {
 					}
 				}
 			}
+
+			//timer_wr_time = timer_wr();
 		} // end of scope for the output files --> auto-close!
+
+		timer_wr_time = timer_wr();
 
 		if (!quiet_mode) {
 			if (show_progress) {
@@ -306,7 +333,28 @@ int main(int argc, const char **argv) {
 	if (!quiet_mode) {
 		std::cerr << "All done." << std::endl;
 		std::cerr << written_line_count << " lines written." << std::endl;
-		std::cerr << timer.to_string() << std::endl;
+		std::cerr << "Timing report:" << std::endl;
+
+		auto cvt = [](double time) -> std::pair<double, std::string> {
+			if (time < .000001)
+				return {time * 1000000000, "ns"};
+			if (time < .001)
+				return {time * 1000000, "us"};
+			if (time < 1)
+				return {time * 1000, "ms"};
+			return {time, "s"};
+		};
+
+		auto t = cvt(timer_rd_time);
+		std::cerr << std::format("{:<25}{:9.3f}{:>3}", "Reading inputs", t.first, t.second) << std::endl;
+		if (timer_sort_time.has_value()) {
+			t = cvt(timer_sort_time.value());
+			std::cerr << std::format("{:<25}{:9.3f}{:>3}", "Sorting the lines", t.first, t.second) << std::endl;
+		}
+		t = cvt(timer_wr_time.value_or(0.0));
+		std::cerr << std::format("{:<25}{:9.3f}{:>3}", "Writing to output", t.first, t.second) << std::endl;
+		t = cvt(timer());
+		std::cerr << std::format("{:<25}{:9.3f}{:>3}", "Total time taken", t.first, t.second) << std::endl;
 	}
 
 	return 0;
